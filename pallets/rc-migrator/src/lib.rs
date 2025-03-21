@@ -49,9 +49,12 @@ pub mod asset_rate;
 pub mod bounties;
 pub mod conviction_voting;
 pub mod scheduler;
+pub mod xcm_config;
 
+use crate::xcm_config::TrustedTeleportersBeforeAndAfter;
 use accounts::AccountsMigrator;
 use claims::{ClaimsMigrator, ClaimsStage};
+use frame_support::traits::ContainsPair;
 use frame_support::{
 	pallet_prelude::*,
 	sp_runtime::traits::AccountIdConversion,
@@ -91,6 +94,7 @@ use vesting::VestingMigrator;
 use weights::WeightInfo;
 use weights_ah::WeightInfo as AhWeightInfo;
 use xcm::prelude::*;
+use xcm_builder::MintLocation;
 
 /// The log target of this pallet.
 pub const LOG_TARGET: &str = "runtime::rc-migrator";
@@ -277,9 +281,9 @@ impl<AccountId, BlockNumber, BagsListScore, VotingClass, AssetKind>
 	pub fn is_ongoing(&self) -> bool {
 		!matches!(
 			self,
-			MigrationStage::Pending |
-				MigrationStage::Scheduled { .. } |
-				MigrationStage::MigrationDone
+			MigrationStage::Pending
+				| MigrationStage::Scheduled { .. }
+				| MigrationStage::MigrationDone
 		)
 	}
 }
@@ -301,6 +305,7 @@ impl<AccountId, BlockNumber, BagsListScore, VotingClass, AssetKind> std::str::Fr
 			"bounties" => MigrationStage::BountiesMigrationInit,
 			"asset_rate" => MigrationStage::AssetRateMigrationInit,
 			"indices" => MigrationStage::IndicesMigrationInit,
+			"proxy" => MigrationStage::ProxyMigrationInit,
 			other => return Err(format!("Unknown migration stage: {}", other)),
 		})
 	}
@@ -387,6 +392,8 @@ pub mod pallet {
 		XcmError,
 		/// Failed to withdraw account from RC for migration to AH.
 		FailedToWithdrawAccount,
+		/// Indicates that the specified block number is in the past.
+		PastBlockNumber,
 	}
 
 	#[pallet::event]
@@ -405,11 +412,23 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type RcMigrationStage<T: Config> = StorageValue<_, MigrationStageOf<T>, ValueQuery>;
 
-	/// Helper storage item to obtain and store the known accounts that should be kept partially on
+	/// Helper storage item to obtain and store the known accounts that should be kept partially or
 	/// fully on Relay Chain.
 	#[pallet::storage]
 	pub type RcAccounts<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, accounts::AccountState<T::Balance>, OptionQuery>;
+
+	/// Helper storage item to store the total balance that should be kept on Relay Chain.
+	#[pallet::storage]
+	pub type RcBalanceKept<T: Config> = StorageValue<_, T::Balance, ValueQuery>;
+
+	/// The total number of XCM data messages sent to the Asset Hub and the number of XCM messages
+	/// the Asset Hub has confirmed as processed.
+	///
+	/// The difference between these two numbers are the messages that are "in-flight". We aim to
+	/// keep this number low to not accidentally overload the asset hub.
+	#[pallet::storage]
+	pub type DmpDataMessageCounts<T: Config> = StorageValue<_, (u32, u32), ValueQuery>;
 
 	/// Alias for `Paras` from `paras_registrar`.
 	///
@@ -453,6 +472,7 @@ pub mod pallet {
 			<T as Config>::ManagerOrigin::ensure_origin(origin)?;
 			let now = frame_system::Pallet::<T>::block_number();
 			let block_number = start_moment.evaluate(now);
+			ensure!(block_number > now, Error::<T>::PastBlockNumber);
 			Self::transition(MigrationStage::Scheduled { block_number });
 			Ok(())
 		}
@@ -466,6 +486,15 @@ pub mod pallet {
 		pub fn start_data_migration(origin: OriginFor<T>) -> DispatchResult {
 			<T as Config>::ManagerOrigin::ensure_origin(origin)?;
 			Self::transition(MigrationStage::AccountsMigrationInit);
+			Ok(())
+		}
+
+		/// Update the total number of XCM messages processed by the Asset Hub.
+		#[pallet::call_index(3)]
+		#[pallet::weight({0})] // TODO: weight
+		pub fn update_ah_msg_processed_count(origin: OriginFor<T>, count: u32) -> DispatchResult {
+			<T as Config>::ManagerOrigin::ensure_origin(origin)?;
+			Self::update_msg_processed_count(count);
 			Ok(())
 		}
 	}
@@ -483,15 +512,21 @@ pub mod pallet {
 			let stage = RcMigrationStage::<T>::get();
 			weight_counter.consume(T::DbWeight::get().reads(1));
 
+			if Self::has_excess_unconfirmed_dmp(&stage) {
+				log::info!(
+					target: LOG_TARGET,
+					"Excess unconfirmed XCM messages, skipping the data extraction for this block."
+				);
+				return weight_counter.consumed();
+			}
+
 			match stage {
 				MigrationStage::Pending => {
-					// TODO: we should do nothing on pending stage.
-					// On production the AH will send a message and initialize the migration.
-					// Now we transition to `AccountsMigrationInit` to run tests
-					Self::transition(MigrationStage::AccountsMigrationInit);
+					return weight_counter.consumed();
 				},
 				MigrationStage::Scheduled { block_number } =>
 					if now >= block_number {
+						// TODO: weight
 						match Self::send_xcm(types::AhMigratorCall::<T>::StartMigration, Weight::from_all(1)) {
 							Ok(_) => {
 								Self::transition(MigrationStage::Initializing);
@@ -506,6 +541,7 @@ pub mod pallet {
 					},
 				MigrationStage::Initializing => {
 					// waiting AH to send a message and to start sending the data
+					return weight_counter.consumed();
 				},
 				MigrationStage::AccountsMigrationInit => {
 					// TODO: weights
@@ -1137,6 +1173,59 @@ pub mod pallet {
 	}
 
 	impl<T: Config> Pallet<T> {
+		/// Returns `true` if the migration is ongoing and the Asset Hub has not confirmed
+		/// processing the same number of XCM messages as we have sent to it.
+		fn has_excess_unconfirmed_dmp(current: &MigrationStageOf<T>) -> bool {
+			if !current.is_ongoing() {
+				return false;
+			}
+			let (sent, processed) = DmpDataMessageCounts::<T>::get();
+			if sent > processed {
+				log::info!(
+					target: LOG_TARGET,
+					"Excess unconfirmed XCM messages: sent = {}, processed = {}",
+					sent,
+					processed
+				);
+				// TODO: make it possible to reset the counts with an extrinsic.
+				return true;
+			}
+			false
+		}
+
+		/// Increases the number of XCM messages sent to the Asset Hub.
+		fn increase_msg_sent_count(count: u32) {
+			let (sent, processed) = DmpDataMessageCounts::<T>::get();
+			let new_sent = sent + count;
+			DmpDataMessageCounts::<T>::put((new_sent, processed));
+			log::debug!(
+				target: LOG_TARGET,
+				"Increased XCM message sent count by {}; sent: {}, processed: {}",
+				count,
+				new_sent,
+				processed
+			);
+		}
+
+		/// Updates the number of XCM messages processed by the Asset Hub.
+		fn update_msg_processed_count(new_processed: u32) {
+			let (sent, processed) = DmpDataMessageCounts::<T>::get();
+			if processed > new_processed {
+				defensive!(
+					"Processed XCM message count is less than the new processed count: {}",
+					(processed, new_processed),
+				);
+				return;
+			}
+			DmpDataMessageCounts::<T>::put((sent, new_processed));
+			log::info!(
+				target: LOG_TARGET,
+				"Updated XCM message processed count to {}; sent: {}",
+				new_processed,
+				sent,
+			);
+		}
+
 		/// Execute a stage transition and log it.
 		fn transition(new: MigrationStageOf<T>) {
 			let old = RcMigrationStage::<T>::get();
@@ -1160,9 +1249,11 @@ pub mod pallet {
 			mut items: Vec<E>,
 			create_call: impl Fn(Vec<E>) -> types::AhMigratorCall<T>,
 			weight_at_most: impl Fn(u32) -> Weight,
-		) -> Result<(), Error<T>> {
-			log::info!(target: LOG_TARGET, "Received {} items to batch send via XCM", items.len());
+		) -> Result<u32, Error<T>> {
+			log::info!(target: LOG_TARGET, "Batching {} items to send via XCM", items.len());
+			defensive_assert!(items.len() > 0, "Sending XCM with empty items");
 			items.reverse();
+			let mut batch_count = 0;
 
 			while !items.is_empty() {
 				let mut remaining_size: u32 = MAX_XCM_SIZE;
@@ -1212,10 +1303,12 @@ pub mod pallet {
 				) {
 					log::error!(target: LOG_TARGET, "Error while sending XCM message: {:?}", err);
 					return Err(Error::XcmError);
-				};
+				} else {
+					batch_count += 1;
+				}
 			}
 
-			Ok(())
+			Ok(batch_count)
 		}
 
 		/// Send a single XCM message.
@@ -1263,6 +1356,50 @@ pub mod pallet {
 
 			Ok(())
 		}
+
+		/// Decorates the `send_chunked_xcm` function by calling the `increase_msg_sent_count`
+		/// function with the number of XCM messages sent.
+		///
+		/// Check the `send_chunked_xcm` function for the documentation.
+		pub fn send_chunked_xcm_and_track<E: Encode>(
+			items: Vec<E>,
+			create_call: impl Fn(Vec<E>) -> types::AhMigratorCall<T>,
+			weight_at_most: impl Fn(u32) -> Weight,
+		) -> Result<u32, Error<T>> {
+			match Self::send_chunked_xcm(items, create_call, weight_at_most) {
+				Ok(count) => {
+					Self::increase_msg_sent_count(count);
+					Ok(count)
+				},
+				Err(e) => Err(e),
+			}
+		}
+
+		/// Decorates the `send_xcm` function by calling the `increase_msg_sent_count` function
+		/// with the number of XCM messages sent.
+		///
+		/// Check the `send_xcm` function for the documentation.
+		pub fn send_xcm_and_track(
+			call: types::AhMigratorCall<T>,
+			weight_at_most: Weight,
+		) -> Result<u32, Error<T>> {
+			match Self::send_xcm(call, weight_at_most) {
+				Ok(_) => {
+					Self::increase_msg_sent_count(1);
+					Ok(1)
+				},
+				Err(e) => Err(e),
+			}
+		}
+
+		pub fn teleport_tracking() -> Option<(T::AccountId, MintLocation)> {
+			let stage = RcMigrationStage::<T>::get();
+			if stage.is_finished() || stage.is_ongoing() {
+				None
+			} else {
+				Some((T::CheckingAccount::get(), MintLocation::Local))
+			}
+		}
 	}
 
 	impl<T: Config> types::MigrationStatus for Pallet<T> {
@@ -1296,5 +1433,19 @@ impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
 		// Otherwise, allow the call.
 		// This also implicitly allows _any_ call if the migration has not yet started.
 		ALLOWED
+	}
+}
+
+// To be used for `IsTeleport` filter. Disallows teleports during the migration.
+impl<T: Config> ContainsPair<Asset, Location> for Pallet<T> {
+	fn contains(asset: &Asset, origin: &Location) -> bool {
+		let stage = RcMigrationStage::<T>::get();
+		if stage.is_ongoing() {
+			// during migration, no teleports (in or out) allowed
+			false
+		} else {
+			// before and after migration use normal filter
+			TrustedTeleportersBeforeAndAfter::contains(asset, origin)
+		}
 	}
 }
